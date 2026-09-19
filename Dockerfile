@@ -42,7 +42,6 @@ RUN apt-get update && \
     libasound2-plugins \
     ca-certificates \
     iproute2 \
-    vim \
     procps && \
 apt-get clean
 
