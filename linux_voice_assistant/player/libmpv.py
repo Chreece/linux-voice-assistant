@@ -28,13 +28,24 @@ class LibMpvPlayer(AudioPlayer):
         self._duck_factor: float = 1.0  # 0.0 – 1.0
 
         # mpv setup
+        # Pi Zero 2 W profile:
+        # Keep libmpv resident between plays and disable unused terminal/video
+        # machinery.  This targets the multi-second first-sound delay reported
+        # after long idle periods on 512 MB Pi Zero 2 W systems.
+        #
+        # TTS responses are short audio files, so a 32 MiB / 20 s cache is
+        # unnecessarily large on this platform.  8 MiB / 5 s keeps enough
+        # readahead for TTS while reducing memory pressure substantially.
         self._mpv = mpv.MPV(
             audio_display=False,
+            idle=True,
+            terminal=False,
+            video=False,
             log_handler=self._on_mpv_log,
             loglevel="error",
             cache="yes",
-            demuxer_max_bytes="32MiB",
-            cache_secs="20",
+            demuxer_max_bytes="8MiB",
+            cache_secs="5",
         )
 
         if device:
