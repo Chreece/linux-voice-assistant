@@ -1,6 +1,6 @@
 """Unit tests for VoiceSatelliteProtocol logic."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -302,6 +302,7 @@ class TestTtsFinished:
             state_overrides={"continue_conversation_delay": 0.5},
         )
         sat._emit = MagicMock()
+        sat.send_messages = MagicMock()
         sat._continue_conversation = False
 
         with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
@@ -321,8 +322,8 @@ class TestTtsFinished:
 
         sat._tts_output_drained(False)
         assert sat._emit.call_args_list == [
-            ((LVAEvent.TTS_FINISHED,),),
-            ((LVAEvent.IDLE,),),
+            call(LVAEvent.TTS_FINISHED),
+            call(LVAEvent.IDLE),
         ]
 
     def test_follow_up_plays_listening_sound_before_opening_mic(self, tmp_path):
@@ -352,14 +353,15 @@ class TestTtsFinished:
 
         sat = make_satellite(tmp_path)
         sat._emit = MagicMock()
+        sat.send_messages = MagicMock()
 
         with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
             sat._tts_finished(wait_for_output_drain=False)
 
         timer_cls.assert_not_called()
         assert sat._emit.call_args_list == [
-            ((LVAEvent.TTS_FINISHED,),),
-            ((LVAEvent.IDLE,),),
+            call(LVAEvent.TTS_FINISHED),
+            call(LVAEvent.IDLE),
         ]
 
 
