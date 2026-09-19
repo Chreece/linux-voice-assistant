@@ -546,15 +546,33 @@ class VoiceSatelliteProtocol(APIServer):
         self._emit(LVAEvent.MUTED, {"muted": self.state.muted})
 
         if self.state.muted:
-            # voice_assistant.stop behavior
-            _LOGGER.debug("Muting voice assistant (voice_assistant.stop)")
+            _LOGGER.debug("Muting voice assistant and aborting active pipeline")
+
+            # Prevent any local callback from opening or continuing the mic.
+            self._continue_conversation = False
             self._is_streaming_audio = False
+            self._pipeline_active = False
+            self.state.active_wake_words.discard(self.state.stop_word.id)
+
+            # start=False is the ESPHome voice-assistant server-side abort. It
+            # closes an already-running HA pipeline instead of merely stopping
+            # local audio forwarding.
+            if self.state.connected:
+                self.send_messages([VoiceAssistantRequest(start=False)])
+
+            # stop() may synchronously invoke a playback completion callback,
+            # so keep muted=True above and clear pipeline flags again below.
             self.state.tts_player.stop()
-            # Stop any ongoing voice processing
+
+            self._continue_conversation = False
+            self._is_streaming_audio = False
+            self._pipeline_active = False
+
+            # Stop any ongoing voice processing and restore background media.
             self.state.stop_word.is_active = False  # type: ignore[attr-defined]
+            self.unduck()
             self.state.tts_player.play(self.state.mute_sound)
         else:
-            # voice_assistant.start_continuous behavior
             _LOGGER.debug("Unmuting voice assistant (voice_assistant.start_continuous)")
             self.state.tts_player.play(self.state.unmute_sound)
             self._emit(LVAEvent.IDLE)
@@ -565,6 +583,14 @@ class VoiceSatelliteProtocol(APIServer):
 
     def handle_voice_event(self, event_type: VoiceAssistantEventType, data: Dict[str, str]) -> None:
         _LOGGER.info("Voice event: type=%s, data=%s", event_type.name, data)
+
+        # An HA abort can race with trailing events from the cancelled run.
+        # While muted, never let those events reactivate pipeline state or TTS.
+        if self.state.muted:
+            self._is_streaming_audio = False
+            self._pipeline_active = False
+            _LOGGER.debug("Ignoring voice event while muted: %s", event_type.name)
+            return
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
             self._tts_url = data.get("url")
@@ -903,6 +929,12 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _start_audio_streaming(self, wake_word_phrase: str) -> None:
         """Start streaming audio during wake sound detection."""
+        if self.state.muted:
+            self._is_streaming_audio = False
+            self._pipeline_active = False
+            _LOGGER.debug("Not starting audio streaming: assistant is muted")
+            return
+
         _LOGGER.debug(
             "Starting audio streaming for: %s",
             wake_word_phrase,
@@ -917,9 +949,7 @@ class VoiceSatelliteProtocol(APIServer):
             "Wakeup sound finished, starting audio streaming for: %s",
             wake_word_phrase,
         )
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
-        self._is_streaming_audio = True
-        self._emit(LVAEvent.LISTENING)
+        self._start_audio_streaming(wake_word_phrase)
 
     def start_listening(self) -> None:
         """
@@ -950,6 +980,13 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _on_start_listening_sound_finished(self) -> None:
         """Callback invoked when the start-listening chime finishes; begin STT streaming."""
+        if self.state.muted:
+            self._is_streaming_audio = False
+            self._pipeline_active = False
+            self.unduck()
+            _LOGGER.debug("Not starting button-listening pipeline: assistant is muted")
+            return
+
         _LOGGER.debug("Start-listening sound finished, starting audio streaming")
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase="")])
         self._is_streaming_audio = True
