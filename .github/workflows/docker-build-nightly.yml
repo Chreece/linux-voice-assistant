@@ -1,5 +1,6 @@
 ---
 name: Build main
+# Centralized Chreece image build
 
 on:
   push:
