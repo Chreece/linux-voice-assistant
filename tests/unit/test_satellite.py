@@ -157,16 +157,8 @@ class TestSetMuted:
 
         sat._set_muted(True)
 
-        sent = [
-            message
-            for write in sat.send_messages.call_args_list
-            for message in write.args[0]
-        ]
-        aborts = [
-            message
-            for message in sent
-            if isinstance(message, VoiceAssistantRequest) and not message.start
-        ]
+        sent = [message for write in sat.send_messages.call_args_list for message in write.args[0]]
+        aborts = [message for message in sent if isinstance(message, VoiceAssistantRequest) and not message.start]
         assert len(aborts) == 1
         assert sat._pipeline_active is False
         assert sat._continue_conversation is False
