@@ -287,7 +287,6 @@ class TestPlayTts:
         assert sat.state.stop_word.id in sat.state.active_wake_words
 
 
-
 # ---------------------------------------------------------------------------
 # TTS completion / continued conversation
 # ---------------------------------------------------------------------------
