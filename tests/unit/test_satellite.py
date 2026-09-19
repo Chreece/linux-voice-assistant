@@ -145,6 +145,42 @@ class TestSetMuted:
         sat._set_muted(True)
         assert sat._is_streaming_audio is False
 
+    def test_muting_aborts_home_assistant_pipeline(self, tmp_path):
+        from aioesphomeapi.api_pb2 import VoiceAssistantRequest
+
+        sat = make_satellite(tmp_path)
+        sat.state.connected = True
+        sat.send_messages = MagicMock()
+        sat._pipeline_active = True
+        sat._continue_conversation = True
+        sat._is_streaming_audio = True
+
+        sat._set_muted(True)
+
+        sent = [
+            message
+            for write in sat.send_messages.call_args_list
+            for message in write.args[0]
+        ]
+        aborts = [
+            message
+            for message in sent
+            if isinstance(message, VoiceAssistantRequest) and not message.start
+        ]
+        assert len(aborts) == 1
+        assert sat._pipeline_active is False
+        assert sat._continue_conversation is False
+        assert sat._is_streaming_audio is False
+
+    def test_muting_does_not_send_abort_when_ha_disconnected(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat.state.connected = False
+        sat.send_messages = MagicMock()
+
+        sat._set_muted(True)
+
+        sat.send_messages.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # _set_thinking_sound_enabled()
@@ -242,6 +278,55 @@ class TestHandleAudio:
         sat._loop = None
         sat.handle_audio(b"\x00" * 320)
         sat._writelines.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Muted callback guards
+# ---------------------------------------------------------------------------
+
+
+class TestMutedCallbackGuards:
+    def test_wakeup_sound_callback_cannot_reopen_mic_while_muted(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat.state.muted = True
+        sat._pipeline_active = True
+        sat.send_messages = MagicMock()
+
+        sat._on_wakeup_sound_finished("Okay Nabu")
+
+        sat.send_messages.assert_not_called()
+        assert sat._is_streaming_audio is False
+        assert sat._pipeline_active is False
+
+    def test_button_sound_callback_cannot_reopen_mic_while_muted(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat.state.muted = True
+        sat._pipeline_active = True
+        sat.send_messages = MagicMock()
+
+        sat._on_start_listening_sound_finished()
+
+        sat.send_messages.assert_not_called()
+        assert sat._is_streaming_audio is False
+        assert sat._pipeline_active is False
+
+    def test_voice_events_cannot_reactivate_pipeline_while_muted(self, tmp_path):
+        from aioesphomeapi.model import VoiceAssistantEventType
+
+        sat = make_satellite(tmp_path)
+        sat.state.muted = True
+        sat._pipeline_active = False
+        sat._is_streaming_audio = False
+        sat._emit = MagicMock()
+
+        sat.handle_voice_event(
+            VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START,
+            {"url": "http://example.com/tts.mp3"},
+        )
+
+        assert sat._pipeline_active is False
+        assert sat._is_streaming_audio is False
+        sat._emit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
