@@ -665,10 +665,7 @@ class VoiceSatelliteProtocol(APIServer):
                 # The pipeline ended sound is for the user's own run, not one another satellite answers
                 # and not one that stopped after speech recognition (the transcript is handled elsewhere).
                 stt_only_run = self._stt_text_received and not self._intent_started
-                self._tts_finished(
-                    pipeline_ended=not (self._run_taken_by_other or stt_only_run),
-                    wait_for_output_drain=False,
-                )
+                self._tts_finished(pipeline_ended=not (self._run_taken_by_other or stt_only_run))
             # When TTS is playing, keep _pipeline_active = True to block
             # false wake word detections from speaker audio feedback.
             # _tts_finished() callback will clear it when playback ends.
@@ -1066,83 +1063,59 @@ class VoiceSatelliteProtocol(APIServer):
         self._emit(LVAEvent.TTS_SPEAKING)
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
-    def _tts_finished(self, pipeline_ended: bool = False, *, wait_for_output_drain: bool = True) -> None:
-        """Finish TTS after allowing the physical audio sink to drain.
-
-        mpv's end-file event means decoding reached EOF, but PulseAudio/PipeWire
-        may still have audible samples buffered. Keep the pipeline/peripheral
-        state in TTS_SPEAKING during the existing continue-conversation delay
-        before emitting TTS_FINISHED or opening the microphone again.
-        :param pipeline_ended: True if the pipeline ended without a spoken reply, which plays the pipeline ended sound.
-        :param wait_for_output_drain: False for a pipeline that ended without TTS playback.
+    def _tts_finished(self, pipeline_ended: bool = False) -> None:
         """
+        Finish a drained playback or a pipeline without speech, then continue the conversation or go idle.
+        :param pipeline_ended: True if the pipeline ended without a spoken reply, which plays the pipeline ended sound.
+        """
+        # LibMpvPlayer already waits for the physical output to drain before invoking this callback.
+        self._pipeline_active = False
         self.state.active_wake_words.discard(self.state.stop_word.id)
-
-        continue_conversation = self._continue_conversation
-        self._continue_conversation = False
-
-        if pipeline_ended or not wait_for_output_drain:
-            self._tts_output_drained(continue_conversation, pipeline_ended=pipeline_ended)
-            return
-
-        self._pipeline_active = True
-        drain_delay = max(0.0, self.state.continue_conversation_delay)
-
-        if drain_delay <= 0:
-            self._tts_output_drained(continue_conversation)
-            return
-
-        _LOGGER.debug(
-            "TTS decoder EOF; keeping speaking state for %.2fs output drain",
-            drain_delay,
-        )
-        timer = threading.Timer(
-            drain_delay,
-            self._tts_output_drained,
-            args=(continue_conversation,),
-        )
-        timer.daemon = True
-        timer.start()
-
-    def _tts_output_drained(self, continue_conversation: bool, *, pipeline_ended: bool = False) -> None:
-        """Finalize TTS once the output sink has had time to drain."""
         self.send_messages([VoiceAssistantAnnounceFinished()])
         self._emit(LVAEvent.TTS_FINISHED)
 
         if self.state.muted:
-            self._pipeline_active = False
+            self._continue_conversation = False
             self.unduck()
-            _LOGGER.debug("TTS output drained while assistant is muted")
+            _LOGGER.debug("TTS response finished while assistant is muted")
             return
 
-        if continue_conversation:
-            # Re-use the existing start-listening cue for follow-up questions.
-            # LISTENING is emitted only after this cue has finished and the
-            # microphone is actually opened.
-            if self.state.start_listening_sound:
-                _LOGGER.debug(
-                    "Playing continued-conversation listening sound: %s",
-                    self.state.start_listening_sound,
-                )
-                self.state.tts_player.play(
-                    self.state.start_listening_sound,
-                    done_callback=self._start_continued_conversation,
-                )
-            else:
-                self._start_continued_conversation()
-            return
-
-        if pipeline_ended and self.state.pipeline_ended_sound:
+        if self._continue_conversation:
+            self._continue_conversation = False
+            # Keep the mic closed through the settle delay and listening cue;
+            # LISTENING is emitted only when audio streaming actually begins.
+            self._pipeline_active = True
+            delay = max(0.0, self.state.continue_conversation_delay)
+            _LOGGER.debug("Continuing conversation after %.2fs settle delay", delay)
+            timer = threading.Timer(delay, self._play_continued_conversation_cue)
+            timer.daemon = True
+            timer.start()
+        elif pipeline_ended and self.state.pipeline_ended_sound:
             _LOGGER.debug("Playing pipeline ended sound")
             # Keep the pipeline active so the sound can't trigger the wake word.
             self._pipeline_active = True
             self.state.tts_player.play(self.state.pipeline_ended_sound, done_callback=self._pipeline_ended_sound_finished)
+        else:
+            self.unduck()
+            self._emit(LVAEvent.IDLE)
+
+        _LOGGER.debug("TTS response finished")
+
+    def _play_continued_conversation_cue(self) -> None:
+        """Play the listening cue before reopening the mic for a follow-up."""
+        if self.state.muted:
+            self._pipeline_active = False
+            self.unduck()
+            _LOGGER.debug("Skipping continued-conversation cue: muted")
             return
 
-        self._pipeline_active = False
-        self.unduck()
-        self._emit(LVAEvent.IDLE)
-        _LOGGER.debug("TTS response fully finished; assistant idle")
+        if self.state.start_listening_sound:
+            self.state.tts_player.play(
+                self.state.start_listening_sound,
+                done_callback=self._start_continued_conversation,
+            )
+        else:
+            self._start_continued_conversation()
 
     def _start_continued_conversation(self) -> None:
         """Open the mic after the continued-conversation listening cue."""

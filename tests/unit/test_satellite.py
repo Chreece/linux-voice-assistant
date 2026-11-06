@@ -370,34 +370,32 @@ class TestPlayTts:
 
 
 class TestTtsFinished:
-    def test_keeps_speaking_state_until_output_drain(self, tmp_path):
+    def test_keeps_speaking_state_until_player_output_drain(self, tmp_path):
         from linux_voice_assistant.peripheral_api import LVAEvent
+        from linux_voice_assistant.player.libmpv import LibMpvPlayer
 
-        sat = make_satellite(
-            tmp_path,
-            state_overrides={"continue_conversation_delay": 0.5},
-        )
+        sat = make_satellite(tmp_path)
         sat._emit = MagicMock()
         sat.send_messages = MagicMock()
-        sat._continue_conversation = False
+        sat._tts_url = "http://example.com/tts.mp3"
+        with patch("linux_voice_assistant.player.libmpv.mpv.MPV"):
+            player = LibMpvPlayer()
+        sat.state.tts_player = player
+        sat.play_tts()
 
-        with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
-            timer = MagicMock()
-            timer_cls.return_value = timer
+        event = MagicMock()
+        event.data.reason = 0
+        with patch("linux_voice_assistant.player.libmpv.threading.Timer") as timer_cls:
+            player._on_end_file(event)
+            sat._emit.assert_called_once_with(LVAEvent.TTS_SPEAKING)
+            sat.send_messages.assert_not_called()
+            with patch("linux_voice_assistant.player.libmpv.threading.current_thread", return_value=timer_cls.return_value):
+                player._finish_playback()
+            # The satellite must not add a second drain timer after the player finishes.
+            assert timer_cls.call_count == 1
 
-            sat._tts_finished()
-
-            sat._emit.assert_not_called()
-            timer_cls.assert_called_once_with(
-                0.5,
-                sat._tts_output_drained,
-                args=(False,),
-            )
-            assert timer.daemon is True
-            timer.start.assert_called_once()
-
-        sat._tts_output_drained(False)
         assert sat._emit.call_args_list == [
+            call(LVAEvent.TTS_SPEAKING),
             call(LVAEvent.TTS_FINISHED),
             call(LVAEvent.IDLE),
         ]
@@ -405,24 +403,53 @@ class TestTtsFinished:
     def test_follow_up_plays_listening_sound_before_opening_mic(self, tmp_path):
         from linux_voice_assistant.peripheral_api import LVAEvent
 
-        sat = make_satellite(tmp_path)
+        sat = make_satellite(tmp_path, {"continue_conversation_delay": 0.5})
         sat._emit = MagicMock()
         sat.send_messages = MagicMock()
         sat._is_streaming_audio = False
+        sat._continue_conversation = True
 
-        sat._tts_output_drained(True)
+        with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
+            sat._tts_finished()
+            timer_cls.assert_called_once_with(0.5, sat._play_continued_conversation_cue)
+            assert timer_cls.return_value.daemon is True
+            timer_cls.return_value.start.assert_called_once()
 
+        sat._play_continued_conversation_cue()
         sat.state.tts_player.play.assert_called_once_with(
             sat.state.start_listening_sound,
             done_callback=sat._start_continued_conversation,
         )
         sat._emit.assert_called_once_with(LVAEvent.TTS_FINISHED)
         assert sat._is_streaming_audio is False
+        assert sat._pipeline_active is True
 
         sat.state.tts_player.play.call_args.kwargs["done_callback"]()
 
         assert sat._is_streaming_audio is True
         sat._emit.assert_called_with(LVAEvent.LISTENING)
+
+    def test_muting_during_settle_delay_suppresses_cue_and_follow_up(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat.send_messages = MagicMock()
+        sat.state.muted = True
+
+        sat._play_continued_conversation_cue()
+
+        sat.state.tts_player.play.assert_not_called()
+        sat.send_messages.assert_not_called()
+        assert sat._pipeline_active is False
+
+    def test_muting_during_listening_cue_suppresses_follow_up(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat.send_messages = MagicMock()
+        sat._play_continued_conversation_cue()
+        sat.state.muted = True
+
+        sat.state.tts_player.play.call_args.kwargs["done_callback"]()
+
+        sat.send_messages.assert_not_called()
+        assert sat._pipeline_active is False
 
     def test_no_tts_run_end_can_finish_without_drain_delay(self, tmp_path):
         from linux_voice_assistant.peripheral_api import LVAEvent
@@ -432,7 +459,7 @@ class TestTtsFinished:
         sat.send_messages = MagicMock()
 
         with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
-            sat._tts_finished(wait_for_output_drain=False)
+            sat._tts_finished()
 
         timer_cls.assert_not_called()
         assert sat._emit.call_args_list == [
@@ -479,6 +506,7 @@ class TestContinueConversation:
             sat._tts_finished()
         _delay, callback = timer_cls.call_args.args
         callback()
+        sat.state.tts_player.play.call_args.kwargs["done_callback"]()
         return sat.send_messages.call_args.args[0][0]
 
     def test_follow_up_resends_wake_word_phrase(self, tmp_path):
