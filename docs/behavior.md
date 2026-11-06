@@ -238,4 +238,16 @@ The *Disable button controls* switch (if the peripheral provides it) lets you lo
 | Media player stop (Home Assistant / peripheral) | Stopped |
 | Last Home Assistant client disconnects | Stopped |
 
+## Raspberry Pi Zero 2 W build
+
+The `pi0w` image retains the behavior described above with smaller media
+read-ahead limits (8 MiB per player and 5 seconds), disabled terminal/video
+handling, and a limit on memory allocator arenas. It requires a Zero 2 W
+with a 64-bit OS; the original ARMv6 Zero / Zero W is not supported by this
+image. See [the Pi Zero 2 W profile](pi_zero_2w.md) for runtime settings.
+
+The playback buffer and audio-drain timing are unchanged. Idle mode keeps
+the player available between files, but it does not hold the audio output
+stream open after a file ends.
+
 > **Note:** This page was written from the program logic. Behavior that depends on audio hardware (exact timing of chimes, ducking audibility) depends on your sound card and audio server.

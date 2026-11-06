@@ -33,15 +33,18 @@ class LibMpvPlayer(AudioPlayer):
         self._user_volume: float = 100.0  # 0.0 – 100.0
         self._duck_factor: float = 1.0  # 0.0 – 1.0
 
-        # mpv setup
+        # Bound read-ahead on the 512 MB Pi Zero 2 W. Keep the player available
+        # between short sounds without terminal or video handling.
         self._mpv = mpv.MPV(
             audio_display=False,
+            idle=True,
+            terminal=False,
             video=False,
             log_handler=self._on_mpv_log,
             loglevel="error",
             cache="yes",
-            demuxer_max_bytes="16MiB",
-            cache_secs="20",
+            demuxer_max_bytes="8MiB",
+            cache_secs="5",
         )
 
         if device:

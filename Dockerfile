@@ -23,6 +23,8 @@ FROM python:3.13-slim-trixie
 ENV LANG C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+# Limit per-thread heap fragmentation on the 512 MB Pi Zero 2 W.
+ENV MALLOC_ARENA_MAX=2
 
 LABEL \
     org.opencontainers.image.authors="Open Home Foundation" \
@@ -45,7 +47,6 @@ LABEL \
 # - libasound2-plugins: Required by python-mpv for audio playback
 # - ca-certificates:    For encrypted connections
 # - iproute2:           For ss command in entrypoint (port check)
-# - vim:                Editor for debugging inside the container
 # - procps:             For pgrep in healthcheck
 #
 # libmpv2 depends on libegl1/libgbm1, which pull in Mesa and LLVM (~170 MB).
@@ -62,7 +63,6 @@ RUN apt-get update && \
     libasound2-plugins \
     ca-certificates \
     iproute2 \
-    vim \
     procps && \
     dpkg --purge --force-depends libllvm19 mesa-libgallium libgl1-mesa-dri libz3-4 && \
     apt-get clean && \
