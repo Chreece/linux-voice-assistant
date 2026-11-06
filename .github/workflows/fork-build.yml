@@ -1,0 +1,170 @@
+name: Build maintained voice images
+
+on:
+  push:
+    branches: [main, usb-respeaker, pi0w]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      flavor:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-images-${{ inputs.flavor || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FLAVOR: ${{ inputs.flavor || github.ref_name }}
+  SOURCE_REF: ${{ inputs.ref || github.sha }}
+
+jobs:
+  check:
+    if: github.repository == 'Chreece/linux-voice-assistant'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      image: ${{ steps.source.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Identify the exact source
+        id: source
+        run: |
+          case "$FLAVOR" in main|usb-respeaker|pi0w) ;; *) exit 1 ;; esac
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev mpv
+          ./script/setup --dev
+      - name: Validate source and synchronization
+        run: |
+          ./script/lint
+          ./script/tests
+          python3 -m unittest discover -s tests/maintenance -v
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON((inputs.flavor || github.ref_name) == 'pi0w' && '[{"runner":"ubuntu-24.04-arm","arch":"arm64"}]' || '[{"runner":"ubuntu-24.04","arch":"amd64"},{"runner":"ubuntu-24.04-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Prepare candidate tags and version files
+        env:
+          IMAGE: ${{ needs.check.outputs.image }}
+          SHA: ${{ needs.check.outputs.sha }}
+          ARCH: ${{ matrix.target.arch }}
+        run: |
+          echo "CANDIDATE=$IMAGE:$FLAVOR-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH" >> "$GITHUB_ENV"
+          echo "PERIPHERAL_CANDIDATE=$IMAGE:respeaker-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH" >> "$GITHUB_ENV"
+          printf '%s\n' "$FLAVOR" > version.txt
+          printf '%s\n' "$SHA" > version_githash.txt
+      - name: Build voice image on its native architecture
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.target.arch }}
+          load: true
+          pull: true
+          tags: ${{ env.CANDIDATE }}
+          cache-from: type=gha,scope=voice-${{ env.FLAVOR }}-${{ matrix.target.arch }}
+          cache-to: type=gha,mode=max,scope=voice-${{ env.FLAVOR }}-${{ matrix.target.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+      - name: Smoke test the installed image
+        run: |
+          docker run --rm --entrypoint /app/.venv/bin/python "$CANDIDATE" -m compileall -q /app/linux_voice_assistant
+          docker run --rm --entrypoint /app/.venv/bin/python "$CANDIDATE" -c 'import mpv, pymicro_wakeword, pyopen_wakeword; player = mpv.MPV(ao="null", vo="null"); player.terminate()'
+      - name: Push checked architecture image
+        run: docker push "$CANDIDATE"
+      - name: Build official USB peripheral
+        if: env.FLAVOR == 'usb-respeaker'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: examples/ReSpeaker Mic Array v2.0 (USB)
+          platforms: linux/${{ matrix.target.arch }}
+          load: true
+          pull: true
+          tags: ${{ env.PERIPHERAL_CANDIDATE }}
+          cache-from: type=gha,scope=peripheral-${{ matrix.target.arch }}
+          cache-to: type=gha,mode=max,scope=peripheral-${{ matrix.target.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+      - name: Check and push USB peripheral
+        if: env.FLAVOR == 'usb-respeaker'
+        run: |
+          docker run --rm --entrypoint python3 "$PERIPHERAL_CANDIDATE" -c 'import usb.backend.libusb1; assert usb.backend.libusb1.get_backend() is not None'
+          docker run --rm "$PERIPHERAL_CANDIDATE" --help
+          docker push "$PERIPHERAL_CANDIDATE"
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish moving tags after every architecture passed
+        env:
+          IMAGE: ${{ needs.check.outputs.image }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          latest=$(git ls-remote origin "refs/heads/$FLAVOR" | cut -f1)
+          if [ "$latest" != "$SHA" ]; then
+            echo "Branch moved during this build; retaining the newer branch's tags." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tags=(--tag "$IMAGE:$FLAVOR" --tag "$IMAGE:$FLAVOR-$SHA")
+          arches=(amd64 arm64)
+          case "$FLAVOR" in
+            main) tags+=(--tag "$IMAGE:latest" --tag "$IMAGE:nightly") ;;
+            usb-respeaker) tags+=(--tag "$IMAGE:custom") ;;
+            pi0w) tags+=(--tag "$IMAGE:pi02w"); arches=(arm64) ;;
+          esac
+          sources=()
+          for arch in "${arches[@]}"; do
+            sources+=("$IMAGE:$FLAVOR-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch")
+          done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$FLAVOR"
+          if [ "$FLAVOR" = usb-respeaker ]; then
+            docker buildx imagetools create \
+              --tag "$IMAGE:respeaker-usb-peripheral" \
+              --tag "$IMAGE:respeaker-usb-peripheral-$SHA" \
+              "$IMAGE:respeaker-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-amd64" \
+              "$IMAGE:respeaker-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-arm64"
+            docker buildx imagetools inspect "$IMAGE:respeaker-usb-peripheral"
+          fi
+          echo "Published $IMAGE:$FLAVOR from $SHA" >> "$GITHUB_STEP_SUMMARY"

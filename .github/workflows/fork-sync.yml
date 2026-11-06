@@ -1,0 +1,96 @@
+name: Synchronize upstream and refresh images
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Chreece/linux-voice-assistant'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      main: ${{ steps.refs.outputs.main }}
+      usb: ${{ steps.refs.outputs.usb }}
+      pi: ${{ steps.refs.outputs.pi }}
+      build: ${{ steps.refs.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - name: Check workflow-update credential
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+        run: |
+          if [ "$HAS_SYNC_TOKEN" != true ]; then
+            echo '::warning::UPSTREAM_SYNC_TOKEN is not configured. The default token can synchronize application changes, but GitHub rejects upstream workflow-file changes. Configure a repository-scoped token with Contents and Workflows write permissions for fully unattended synchronization.'
+          fi
+      - name: Rebase all maintained branches
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 scripts/sync_upstream.py > "$RUNNER_TEMP/sync.json"
+          python3 - <<'PY'
+          import datetime, json, os
+          from pathlib import Path
+          data = json.loads(Path(os.environ['RUNNER_TEMP'], 'sync.json').read_text())
+          daily = datetime.datetime.now(datetime.timezone.utc).hour == 4
+          build = data['changed'] or daily or os.environ['FORCE_BUILD'] == 'true'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('main=' + data['refs']['main'], file=output)
+              print('usb=' + data['refs']['usb-respeaker'], file=output)
+              print('pi=' + data['refs']['pi0w'], file=output)
+              print('build=' + str(build).lower(), file=output)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print('Upstream: `' + data['upstream'] + '`', file=summary)
+              for name, sha in data['refs'].items():
+                  print(f'- {name}: `{sha}`', file=summary)
+              print('\nImage refresh: ' + str(build), file=summary)
+          PY
+        id: refs
+
+  main-image:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    uses: ./.github/workflows/fork-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ needs.sync.outputs.main }}
+      flavor: main
+
+  usb-image:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    uses: ./.github/workflows/fork-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ needs.sync.outputs.usb }}
+      flavor: usb-respeaker
+
+  pi-image:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    uses: ./.github/workflows/fork-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ needs.sync.outputs.pi }}
+      flavor: pi0w

@@ -12,6 +12,7 @@ env:
 
 jobs:
   build-and-push-image:
+    if: github.repository == 'OHF-Voice/linux-voice-assistant'
     runs-on: ubuntu-latest
     permissions:
       contents: read
