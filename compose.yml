@@ -1,0 +1,195 @@
+# Published voice stack. Existing .env and named volumes are retained.
+# Download all image updates: docker compose pull
+# Apply downloaded images: docker compose up -d
+# Or download and apply in one command: docker compose up -d --pull always
+services:
+  # Fix permissions for wakeword_data and configuration volume
+  fix-permissions:
+    image: "ghcr.io/chreece/linux-voice-assistant:usb-respeaker"
+    pull_policy: always
+    user: "0:0"
+    entrypoint: []
+    command: "chown -R ${LVA_USER_ID}:${LVA_USER_GROUP} /app/local /app/configuration /app/wakewords/custom /app/sounds/custom"
+    env_file: ${ENV_FILE:-.env}
+    group_add:
+      - audio
+    volumes:
+      - wakeword_data:/app/local
+      - wakeword_custom:/app/wakewords/custom
+      - configuration:/app/configuration
+      - sounds_custom:/app/sounds/custom
+    restart: "no"
+
+  # Linux Voice Assistant satellite
+  linux-voice-assistant:
+    container_name: linux-voice-assistant
+    image: "ghcr.io/chreece/linux-voice-assistant:usb-respeaker"
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: "host"
+    user: "${LVA_USER_ID}:${LVA_USER_GROUP}"
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      PERIPHERAL_PORT: "6056"
+      XDG_RUNTIME_DIR: /run/user/1000
+      PULSE_SERVER: unix:/run/user/1000/pulse/native
+      PULSE_COOKIE: /tmp/pulse-cookie
+      LVA_PULSE_COOKIE: /tmp/pulse-cookie
+      PULSE_SINK: alsa_output.pci-0000_00_1f.3.analog-stereo
+      PULSE_SOURCE: alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.mono-fallback
+    group_add:
+      - audio
+    cap_add:
+      - SYS_NICE
+    volumes:
+      - wakeword_data:/app/local
+      - wakeword_custom:/app/wakewords/custom
+      - configuration:/app/configuration
+      - sounds_custom:/app/sounds/custom
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native
+      - /home/chreece/.config/pulse/cookie:/tmp/pulse-cookie:ro
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "linux_voice_assistant"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  # Full Whisper large-v3 on AMD ROCm.
+  # CTranslate2 on ROCm uses the device name "cuda".
+  wyoming-whisper:
+    container_name: wyoming-whisper
+    image: "ghcr.io/chreece/whisper-rocm:latest"
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: "host"
+
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+
+    environment:
+      HF_HOME: /data
+      XDG_CACHE_HOME: /data
+      MODELSCOPE_CACHE: /data/modelscope
+      CT2_CUDA_ALLOCATOR: "cub_caching"
+      CT2_VERBOSE: "1"
+
+      GPU_MAX_HW_QUEUES: "1"
+    volumes:
+      - whisper_data:/data
+      - /etc/localtime:/etc/localtime:ro
+
+    entrypoint:
+      - python3
+      - -m
+      - wyoming_faster_whisper
+
+    command:
+      - --uri
+      - tcp://0.0.0.0:10300
+      - --model
+      - "large-v3"
+      - --data-dir
+      - /data
+      - --download-dir
+      - /data
+      - --language
+      - el
+      - --device
+      - cuda
+      - --compute-type
+      - "float16"
+      - --beam-size
+      - "2"
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -m
+        - wyoming_faster_whisper.health_check
+        - --uri
+        - tcp://127.0.0.1:10300
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 5m
+      
+  respeaker-usb-peripheral:
+    container_name: respeaker-usb-peripheral
+    image: "ghcr.io/chreece/linux-voice-assistant:respeaker-usb-peripheral"
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - PYTHONUNBUFFERED=1
+    command:
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "6056"
+    depends_on:
+      - linux-voice-assistant
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1',6056),5); s.close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  wyoming-piper:
+    image: rhasspy/wyoming-piper:latest
+    container_name: wyoming-piper
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --uri
+      - tcp://0.0.0.0:10200
+      - --voice
+      - el_GR-joy-medium
+      - --data-dir
+      - /data
+      - --download-dir
+      - /data
+      - --length-scale
+      - "1.0"
+    volumes:
+      - ./piper-data:/data
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test:
+        - CMD
+        - /usr/src/.venv/bin/python3
+        - -m
+        - wyoming_piper.health_check
+        - --uri
+        - tcp://127.0.0.1:10200
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  wakeword_data:
+  wakeword_custom:
+  configuration:
+  sounds_custom:
+  whisper_data:

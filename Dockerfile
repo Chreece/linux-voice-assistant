@@ -23,6 +23,7 @@ FROM python:3.13-slim-trixie
 ENV LANG C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PERIPHERAL_PORT=6056
 
 LABEL \
     org.opencontainers.image.authors="Open Home Foundation" \
