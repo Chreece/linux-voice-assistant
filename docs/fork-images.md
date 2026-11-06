@@ -55,8 +55,14 @@ These checks do not replace microphone, speaker, LED, or Pi hardware testing.
 Every source revision also has a tag such as `usb-respeaker-<full-commit-SHA>`.
 Docker labels record the source revision. Build logs and failures appear under
 the repository's Actions tab. GitHub can disable scheduled workflows in public
-repositories after 60 days without repository activity; re-enable the workflow
-there if GitHub marks it inactive.
+repositories after 60 days without repository activity. To prevent inactivity
+during quiet upstream periods, the sync workflow records the checked upstream
+SHA and UTC month in `maintenance/upstream-check.json`. It commits that source
+record only when the SHA or month changes, so repeated hourly checks of the
+same source create no extra commits. This records a source check, not a passing
+build or hardware test. The record and all branch rebases are pushed together;
+a later rebase conflict leaves every remote branch unchanged. If the workflow
+is already disabled, re-enable it in Actions so these checks can resume.
 
 ## USB ReSpeaker server
 

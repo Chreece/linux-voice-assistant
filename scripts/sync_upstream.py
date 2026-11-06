@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -20,7 +21,7 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
-def synchronize(repo, upstream, remote="origin", dry_run=False):
+def synchronize(repo, upstream, remote="origin", dry_run=False, record_check=False):
     """Stage all rebases before an atomic, lease-guarded push."""
     repo = Path(repo).resolve()
     if git(repo, "status", "--porcelain", "--untracked-files=no"):
@@ -53,6 +54,8 @@ def synchronize(repo, upstream, remote="origin", dry_run=False):
                     worktrees.append(worktree)
                     if branch == "main":
                         git(worktree, "rebase", "--rebase-merges", upstream_sha)
+                        if record_check:
+                            _record_upstream_check(worktree, upstream_sha)
                     else:
                         base = git(repo, "merge-base", old["main"], old[branch])
                         git(worktree, "rebase", "--rebase-merges", "--onto", staged["main"], base)
@@ -75,12 +78,22 @@ def synchronize(repo, upstream, remote="origin", dry_run=False):
                     )
                     git(repo, "worktree", "remove", "--force", str(worktree))
     except RuntimeError as error:
-        raise RuntimeError(
-            "Synchronization stopped. Updates use an atomic, lease-guarded push; "
-            f"inspect remote branch heads before retrying.\n{error}"
-        ) from error
+        raise RuntimeError("Synchronization stopped. Updates use an atomic, lease-guarded push; " f"inspect remote branch heads before retrying.\n{error}") from error
 
     return {"upstream": upstream_sha, "refs": staged, "previous": old, "changed": bool(changed), "dry_run": dry_run}
+
+
+def _record_upstream_check(repo, upstream_sha):
+    """Record source provenance without creating repeated same-month commits."""
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    path = Path(repo) / "maintenance" / "upstream-check.json"
+    content = json.dumps({"upstream": upstream_sha, "checked_month": month}, indent=2, sort_keys=True) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    git(repo, "add", "maintenance/upstream-check.json")
+    git(repo, "commit", "--message", f"Record upstream source check for {month}")
 
 
 def main():
@@ -89,8 +102,9 @@ def main():
     parser.add_argument("--upstream", default="https://github.com/OHF-Voice/linux-voice-assistant.git")
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--record-check", action="store_true", help="Record the checked upstream SHA and UTC month in the synchronized branches")
     args = parser.parse_args()
-    print(json.dumps(synchronize(args.repo, args.upstream, args.remote, args.dry_run)))
+    print(json.dumps(synchronize(args.repo, args.upstream, args.remote, args.dry_run, args.record_check)))
 
 
 if __name__ == "__main__":

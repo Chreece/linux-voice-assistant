@@ -2,11 +2,14 @@
 """Exercise upstream synchronization using isolated local Git repositories."""
 
 import importlib.util
+import json
 import shlex
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sync_upstream.py"
 _SPEC = importlib.util.spec_from_file_location("lva_sync_upstream", _SCRIPT)
@@ -109,7 +112,7 @@ class SynchronizeUpstreamTests(unittest.TestCase):
         old = self.remote_heads()
 
         with self.assertRaisesRegex(RuntimeError, "Synchronization stopped"):
-            _SYNC.synchronize(self.checkout, str(self.upstream))
+            _SYNC.synchronize(self.checkout, str(self.upstream), record_check=True)
 
         self.assertEqual(self.remote_heads(), old)
         self.assert_checkout_preserved()
@@ -119,7 +122,7 @@ class SynchronizeUpstreamTests(unittest.TestCase):
         old = self.remote_heads()
         local_head = self.git(self.checkout, "rev-parse", "HEAD")
 
-        result = _SYNC.synchronize(self.checkout, str(self.upstream), dry_run=True)
+        result = _SYNC.synchronize(self.checkout, str(self.upstream), dry_run=True, record_check=True)
 
         self.assertTrue(result["changed"])
         self.assertTrue(result["dry_run"])
@@ -127,6 +130,34 @@ class SynchronizeUpstreamTests(unittest.TestCase):
         self.assertNotEqual(result["refs"]["main"], old["main"])
         self.assertEqual(self.remote_heads(), old)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), local_head)
+        self.assert_checkout_preserved()
+
+    def test_source_check_records_only_new_upstream_or_month(self):
+        old = self.remote_heads()
+        with patch.object(_SYNC, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 6, 12, tzinfo=timezone.utc)
+            first = _SYNC.synchronize(self.checkout, str(self.upstream), record_check=True)
+            first_heads = self.remote_heads()
+
+            self.assertTrue(first["changed"])
+            self.assertEqual(first["refs"], first_heads)
+            self.assertEqual(self.git(self.origin, "diff", "--name-only", old["main"], first_heads["main"]), "maintenance/upstream-check.json")
+            self.assertEqual(self.git(self.origin, "rev-list", "--count", f"{old['main']}..{first_heads['main']}"), "1")
+            for branch in first_heads:
+                record = json.loads(self.git(self.origin, "show", f"{branch}:maintenance/upstream-check.json"))
+                self.assertEqual(record, {"upstream": self.upstream_sha, "checked_month": "2026-11"})
+
+            second = _SYNC.synchronize(self.checkout, str(self.upstream), record_check=True)
+            self.assertFalse(second["changed"])
+            self.assertEqual(second["refs"], first_heads)
+            self.assertEqual(self.remote_heads(), first_heads)
+
+            clock.now.return_value = datetime(2026, 12, 1, tzinfo=timezone.utc)
+            third = _SYNC.synchronize(self.checkout, str(self.upstream), record_check=True)
+            self.assertTrue(third["changed"])
+            self.assertEqual(self.git(self.origin, "rev-list", "--count", f"{first_heads['main']}..{third['refs']['main']}"), "1")
+            record = json.loads(self.git(self.origin, "show", "main:maintenance/upstream-check.json"))
+            self.assertEqual(record, {"upstream": self.upstream_sha, "checked_month": "2026-12"})
         self.assert_checkout_preserved()
 
     def test_distinct_pi02w_changes_are_not_overwritten_by_alias_refresh(self):
