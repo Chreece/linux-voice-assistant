@@ -355,6 +355,9 @@ class VoiceSatelliteProtocol(APIServer):
         self._intent_started = False
         self._stt_text_received = False
         self._continue_conversation = False
+        self._listening_generation = 0
+        self._continue_timer: Optional[threading.Timer] = None
+        self._listening_lock = threading.RLock()
         # Phrase that started the conversation. HA selects the pipeline from it, so a
         # follow-up request without it would run the first pipeline instead of the one
         # the user woke up. Empty after a button press or an HA announcement.
@@ -562,7 +565,7 @@ class VoiceSatelliteProtocol(APIServer):
             _LOGGER.debug("Muting voice assistant and aborting active pipeline")
 
             # Prevent any local callback from opening or continuing the mic.
-            self._continue_conversation = False
+            self._cancel_pending_listening()
             self._is_streaming_audio = False
             self._pipeline_active = False
             self.state.active_wake_words.discard(self.state.stop_word.id)
@@ -606,6 +609,7 @@ class VoiceSatelliteProtocol(APIServer):
             return
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
+            self._cancel_pending_listening()
             self._tts_url = data.get("url")
             self._tts_played = False
             self._run_taken_by_other = False
@@ -739,6 +743,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.handle_voice_event(VoiceAssistantEventType(msg.event_type), data)
 
         elif isinstance(msg, VoiceAssistantAnnounceRequest):
+            self._cancel_pending_listening()
             _LOGGER.debug("Announcing: %s", msg.text)
 
             assert self.state.media_player_entity is not None
@@ -948,6 +953,7 @@ class VoiceSatelliteProtocol(APIServer):
         wake_word_phrase = wake_word.wake_word  # type: ignore[union-attr]
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
         self._wake_word_phrase = wake_word_phrase
+        generation = self._listening_generation
 
         self._timer_finished = False
         self._timer_ring_start = None
@@ -958,36 +964,42 @@ class VoiceSatelliteProtocol(APIServer):
         if self.state.listen_during_wake_sound:
             _LOGGER.debug("Starting audio streaming immediately (listen_during_wake_sound enabled)")
             self.state.tts_player.play(self.state.wakeup_sound)
-            self._start_audio_streaming(wake_word_phrase)
+            self._start_audio_streaming(wake_word_phrase, generation)
         else:
             self.state.tts_player.play(
                 self.state.wakeup_sound,
-                done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase),
+                done_callback=partial(self._on_wakeup_sound_finished, wake_word_phrase, generation),
             )
 
-    def _start_audio_streaming(self, wake_word_phrase: str) -> None:
+    def _start_audio_streaming(self, wake_word_phrase: str, generation: int) -> None:
         """Start streaming audio during wake sound detection."""
-        if self.state.muted:
-            self._is_streaming_audio = False
-            self._pipeline_active = False
-            _LOGGER.debug("Not starting audio streaming: assistant is muted")
-            return
+        with self._listening_lock:
+            if generation != self._listening_generation:
+                return
+            if self.state.muted or self._disconnect_event.is_set():
+                self._is_streaming_audio = False
+                self._pipeline_active = False
+                self.unduck()
+                _LOGGER.debug("Not starting audio streaming: assistant is muted or disconnected")
+                return
 
-        _LOGGER.debug(
-            "Starting audio streaming for: %s",
-            wake_word_phrase,
-        )
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
-        self._is_streaming_audio = True
-        self._emit(LVAEvent.LISTENING)
+            _LOGGER.debug(
+                "Starting audio streaming for: %s",
+                wake_word_phrase,
+            )
+            self._listening_generation += 1
+            self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
+            self._is_streaming_audio = True
+            self._pipeline_active = True
+            self._emit(LVAEvent.LISTENING)
 
-    def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
+    def _on_wakeup_sound_finished(self, wake_word_phrase: str, generation: int) -> None:
         """Callback invoked when the wakeup chime finishes; begin STT streaming."""
         _LOGGER.debug(
             "Wakeup sound finished, starting audio streaming for: %s",
             wake_word_phrase,
         )
-        self._start_audio_streaming(wake_word_phrase)
+        self._start_audio_streaming(wake_word_phrase, generation)
 
     def start_listening(self) -> None:
         """
@@ -1014,39 +1026,33 @@ class VoiceSatelliteProtocol(APIServer):
         self.duck()
         self.state.tts_player.play(
             self.state.start_listening_sound,
-            done_callback=self._on_start_listening_sound_finished,
+            done_callback=partial(self._on_start_listening_sound_finished, self._listening_generation),
         )
 
-    def _on_start_listening_sound_finished(self) -> None:
+    def _on_start_listening_sound_finished(self, generation: int) -> None:
         """Callback invoked when the start-listening chime finishes; begin STT streaming."""
-        if self.state.muted:
-            self._is_streaming_audio = False
-            self._pipeline_active = False
-            self.unduck()
-            _LOGGER.debug("Not starting button-listening pipeline: assistant is muted")
-            return
-
         _LOGGER.debug("Start-listening sound finished, starting audio streaming")
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase="")])
-        self._is_streaming_audio = True
-        self._emit(LVAEvent.LISTENING)
+        self._start_audio_streaming("", generation)
 
     def stop(self) -> None:
+        self._cancel_pending_listening()
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
+        self._is_streaming_audio = False
 
         if self._timer_finished:
             self._timer_finished = False
             self._timer_ring_start = None
-            self.unduck()
             self.state.tts_player.stop()
-            self._emit(LVAEvent.IDLE)
             _LOGGER.debug("Stopping timer finished sound")
         else:
-            # tts_player.stop() invokes the done_callback (_tts_finished),
-            # so we don't call _tts_finished() again explicitly.
+            # tts_player.stop() invokes its outstanding completion callback;
+            # canceled chimes must not use that callback to reopen the mic.
             self.state.tts_player.stop()
             _LOGGER.debug("TTS response stopped manually")
+
+        self.unduck()
+        self._emit(LVAEvent.IDLE)
 
     # ------------------------------------------------------------------
     # TTS
@@ -1069,67 +1075,87 @@ class VoiceSatelliteProtocol(APIServer):
         :param pipeline_ended: True if the pipeline ended without a spoken reply, which plays the pipeline ended sound.
         """
         # LibMpvPlayer already waits for the physical output to drain before invoking this callback.
-        self._pipeline_active = False
-        self.state.active_wake_words.discard(self.state.stop_word.id)
-        self.send_messages([VoiceAssistantAnnounceFinished()])
-        self._emit(LVAEvent.TTS_FINISHED)
+        with self._listening_lock:
+            self._pipeline_active = False
+            self.state.active_wake_words.discard(self.state.stop_word.id)
+            self.send_messages([VoiceAssistantAnnounceFinished()])
+            self._emit(LVAEvent.TTS_FINISHED)
 
-        if self.state.muted:
+            if self.state.muted or self._disconnect_event.is_set():
+                self._continue_conversation = False
+                self.unduck()
+                _LOGGER.debug("TTS response finished while assistant is muted or disconnected")
+                return
+
+            if self._continue_conversation:
+                self._continue_conversation = False
+                # Keep the mic closed through the settle delay and listening cue;
+                # LISTENING is emitted only when audio streaming actually begins.
+                self._pipeline_active = True
+                delay = max(0.0, self.state.continue_conversation_delay)
+                _LOGGER.debug("Continuing conversation after %.2fs settle delay", delay)
+                self._listening_generation += 1
+                timer = threading.Timer(delay, self._play_continued_conversation_cue, args=(self._listening_generation,))
+                timer.daemon = True
+                self._continue_timer = timer
+                timer.start()
+            elif pipeline_ended and self.state.pipeline_ended_sound:
+                _LOGGER.debug("Playing pipeline ended sound")
+                # Keep the pipeline active so the sound can't trigger the wake word.
+                self._pipeline_active = True
+                self.state.tts_player.play(self.state.pipeline_ended_sound, done_callback=self._pipeline_ended_sound_finished)
+            else:
+                self.unduck()
+                self._emit(LVAEvent.IDLE)
+
+            _LOGGER.debug("TTS response finished")
+
+    def _cancel_pending_listening(self) -> None:
+        """Invalidate pending timers and all chime callbacks that could reopen the mic."""
+        with self._listening_lock:
+            self._listening_generation += 1
             self._continue_conversation = False
-            self.unduck()
-            _LOGGER.debug("TTS response finished while assistant is muted")
-            return
+            if self._continue_timer is not None:
+                self._continue_timer.cancel()
+                self._continue_timer = None
 
-        if self._continue_conversation:
-            self._continue_conversation = False
-            # Keep the mic closed through the settle delay and listening cue;
-            # LISTENING is emitted only when audio streaming actually begins.
-            self._pipeline_active = True
-            delay = max(0.0, self.state.continue_conversation_delay)
-            _LOGGER.debug("Continuing conversation after %.2fs settle delay", delay)
-            timer = threading.Timer(delay, self._play_continued_conversation_cue)
-            timer.daemon = True
-            timer.start()
-        elif pipeline_ended and self.state.pipeline_ended_sound:
-            _LOGGER.debug("Playing pipeline ended sound")
-            # Keep the pipeline active so the sound can't trigger the wake word.
-            self._pipeline_active = True
-            self.state.tts_player.play(self.state.pipeline_ended_sound, done_callback=self._pipeline_ended_sound_finished)
-        else:
-            self.unduck()
-            self._emit(LVAEvent.IDLE)
-
-        _LOGGER.debug("TTS response finished")
-
-    def _play_continued_conversation_cue(self) -> None:
+    def _play_continued_conversation_cue(self, generation: int) -> None:
         """Play the listening cue before reopening the mic for a follow-up."""
-        if self.state.muted:
-            self._pipeline_active = False
-            self.unduck()
-            _LOGGER.debug("Skipping continued-conversation cue: muted")
-            return
+        with self._listening_lock:
+            if generation != self._listening_generation:
+                return
+            self._continue_timer = None
+            if self.state.muted or self._disconnect_event.is_set():
+                self._pipeline_active = False
+                self.unduck()
+                _LOGGER.debug("Skipping continued-conversation cue: muted or disconnected")
+                return
 
-        if self.state.start_listening_sound:
-            self.state.tts_player.play(
-                self.state.start_listening_sound,
-                done_callback=self._start_continued_conversation,
-            )
-        else:
-            self._start_continued_conversation()
+            if self.state.start_listening_sound:
+                self.state.tts_player.play(
+                    self.state.start_listening_sound,
+                    done_callback=partial(self._start_continued_conversation, generation),
+                )
+            else:
+                self._start_continued_conversation(generation)
 
-    def _start_continued_conversation(self) -> None:
+    def _start_continued_conversation(self, generation: int) -> None:
         """Open the mic after the continued-conversation listening cue."""
-        if self.state.muted:
-            _LOGGER.debug("Skipping continued conversation: muted")
-            self._pipeline_active = False
-            self.unduck()
-            return
+        with self._listening_lock:
+            if generation != self._listening_generation:
+                return
+            if self.state.muted or self._disconnect_event.is_set():
+                _LOGGER.debug("Skipping continued conversation: muted or disconnected")
+                self._pipeline_active = False
+                self.unduck()
+                return
 
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=self._wake_word_phrase)])
-        self._is_streaming_audio = True
-        self._pipeline_active = True
-        self._emit(LVAEvent.LISTENING)
-        _LOGGER.debug("Continued conversation listening started")
+            self._listening_generation += 1
+            self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=self._wake_word_phrase)])
+            self._is_streaming_audio = True
+            self._pipeline_active = True
+            self._emit(LVAEvent.LISTENING)
+            _LOGGER.debug("Continued conversation listening started")
 
     def _pipeline_ended_sound_finished(self) -> None:
         self._pipeline_active = False
@@ -1197,6 +1223,7 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
 
         self._disconnect_event.set()
+        self._cancel_pending_listening()
         self._is_streaming_audio = False
         self._tts_url = None
         self._tts_played = False

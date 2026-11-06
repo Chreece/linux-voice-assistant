@@ -284,7 +284,7 @@ class TestMutedCallbackGuards:
         sat._pipeline_active = True
         sat.send_messages = MagicMock()
 
-        sat._on_wakeup_sound_finished("Okay Nabu")
+        sat._on_wakeup_sound_finished("Okay Nabu", sat._listening_generation)
 
         sat.send_messages.assert_not_called()
         assert sat._is_streaming_audio is False
@@ -296,11 +296,42 @@ class TestMutedCallbackGuards:
         sat._pipeline_active = True
         sat.send_messages = MagicMock()
 
-        sat._on_start_listening_sound_finished()
+        sat._on_start_listening_sound_finished(sat._listening_generation)
 
         sat.send_messages.assert_not_called()
         assert sat._is_streaming_audio is False
         assert sat._pipeline_active is False
+
+    @pytest.mark.parametrize("start", ["button", "wake_word"])
+    @pytest.mark.parametrize("cancel", ["stop", "mute_then_unmute", "disconnect"])
+    def test_cancelled_start_chime_cannot_reopen_mic(self, tmp_path, start, cancel):
+        from linux_voice_assistant.peripheral_api import LVAEvent
+
+        sat = make_satellite(tmp_path)
+        sat._emit = MagicMock()
+        sat.send_messages = MagicMock()
+        if start == "button":
+            sat.start_listening()
+        else:
+            sat.wakeup(MagicMock(wake_word="Okay Nabu"))
+        callback = sat.state.tts_player.play.call_args.kwargs["done_callback"]
+        sat.state.tts_player.stop.side_effect = callback
+
+        if cancel == "stop":
+            sat.stop()
+        elif cancel == "mute_then_unmute":
+            sat._set_muted(True)
+            sat._set_muted(False)
+        else:
+            sat.connection_lost(None)
+        callback()
+
+        sat.send_messages.assert_not_called()
+        assert sat._is_streaming_audio is False
+        assert sat._pipeline_active is False
+        if cancel == "stop":
+            sat._emit.assert_called_with(LVAEvent.IDLE)
+            sat.state.music_player.unduck.assert_called()
 
     def test_voice_events_cannot_reactivate_pipeline_while_muted(self, tmp_path):
         from aioesphomeapi.model import VoiceAssistantEventType
@@ -411,15 +442,13 @@ class TestTtsFinished:
 
         with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
             sat._tts_finished()
-            timer_cls.assert_called_once_with(0.5, sat._play_continued_conversation_cue)
+            timer_cls.assert_called_once_with(0.5, sat._play_continued_conversation_cue, args=(sat._listening_generation,))
             assert timer_cls.return_value.daemon is True
             timer_cls.return_value.start.assert_called_once()
 
-        sat._play_continued_conversation_cue()
-        sat.state.tts_player.play.assert_called_once_with(
-            sat.state.start_listening_sound,
-            done_callback=sat._start_continued_conversation,
-        )
+        sat._play_continued_conversation_cue(sat._listening_generation)
+        sat.state.tts_player.play.assert_called_once()
+        assert sat.state.tts_player.play.call_args.args[0] == sat.state.start_listening_sound
         sat._emit.assert_called_once_with(LVAEvent.TTS_FINISHED)
         assert sat._is_streaming_audio is False
         assert sat._pipeline_active is True
@@ -434,7 +463,7 @@ class TestTtsFinished:
         sat.send_messages = MagicMock()
         sat.state.muted = True
 
-        sat._play_continued_conversation_cue()
+        sat._play_continued_conversation_cue(sat._listening_generation)
 
         sat.state.tts_player.play.assert_not_called()
         sat.send_messages.assert_not_called()
@@ -443,12 +472,81 @@ class TestTtsFinished:
     def test_muting_during_listening_cue_suppresses_follow_up(self, tmp_path):
         sat = make_satellite(tmp_path)
         sat.send_messages = MagicMock()
-        sat._play_continued_conversation_cue()
+        sat._play_continued_conversation_cue(sat._listening_generation)
         sat.state.muted = True
 
         sat.state.tts_player.play.call_args.kwargs["done_callback"]()
 
         sat.send_messages.assert_not_called()
+        assert sat._pipeline_active is False
+
+    @pytest.mark.parametrize("cancel", ["stop", "mute_then_unmute", "disconnect", "new_run", "new_announcement"])
+    def test_cancelled_settle_timer_cannot_play_cue(self, tmp_path, cancel):
+        from aioesphomeapi import VoiceAssistantEventType
+        from aioesphomeapi.api_pb2 import VoiceAssistantAnnounceRequest
+
+        sat = make_satellite(tmp_path)
+        sat.send_messages = MagicMock()
+        sat._continue_conversation = True
+        with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
+            sat._tts_finished()
+        _delay, callback = timer_cls.call_args.args
+        callback_args = timer_cls.call_args.kwargs["args"]
+
+        if cancel == "stop":
+            sat.stop()
+        elif cancel == "mute_then_unmute":
+            sat._set_muted(True)
+            sat._set_muted(False)
+        elif cancel == "disconnect":
+            sat.connection_lost(None)
+        elif cancel == "new_run":
+            sat.handle_voice_event(VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START, {})
+        else:
+            list(sat.handle_message(VoiceAssistantAnnounceRequest(media_id="http://example.com/new.mp3")))
+        sat.state.tts_player.play.reset_mock()
+        sat.send_messages.reset_mock()
+
+        # A timer callback may already be queued when cancel() runs.
+        callback(*callback_args)
+
+        timer_cls.return_value.cancel.assert_called_once()
+        sat.state.tts_player.play.assert_not_called()
+        sat.send_messages.assert_not_called()
+
+    @pytest.mark.parametrize("cancel", ["stop", "mute_then_unmute", "disconnect"])
+    def test_cancelled_cue_callback_cannot_reopen_mic(self, tmp_path, cancel):
+        sat = make_satellite(tmp_path)
+        sat.send_messages = MagicMock()
+        sat._play_continued_conversation_cue(sat._listening_generation)
+        callback = sat.state.tts_player.play.call_args.kwargs["done_callback"]
+        # MpvMediaPlayer.stop() synchronously invokes its outstanding callback.
+        sat.state.tts_player.stop.side_effect = callback
+        if cancel == "stop":
+            sat.stop()
+        elif cancel == "mute_then_unmute":
+            sat._set_muted(True)
+            sat._set_muted(False)
+        else:
+            sat.connection_lost(None)
+        sat.send_messages.reset_mock()
+
+        callback()
+
+        sat.send_messages.assert_not_called()
+        assert sat._is_streaming_audio is False
+        assert sat._pipeline_active is False
+
+    def test_stop_during_tts_cannot_schedule_follow_up(self, tmp_path):
+        sat = make_satellite(tmp_path)
+        sat._continue_conversation = True
+        sat.state.tts_player.stop.side_effect = sat._tts_finished
+
+        with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
+            sat.stop()
+
+        timer_cls.assert_not_called()
+        assert sat._continue_conversation is False
         assert sat._pipeline_active is False
 
     def test_no_tts_run_end_can_finish_without_drain_delay(self, tmp_path):
@@ -505,7 +603,7 @@ class TestContinueConversation:
         with patch("linux_voice_assistant.satellite.threading.Timer") as timer_cls:
             sat._tts_finished()
         _delay, callback = timer_cls.call_args.args
-        callback()
+        callback(*timer_cls.call_args.kwargs["args"])
         sat.state.tts_player.play.call_args.kwargs["done_callback"]()
         return sat.send_messages.call_args.args[0][0]
 
