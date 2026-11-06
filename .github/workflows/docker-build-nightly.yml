@@ -50,6 +50,7 @@ jobs:
           images: ${{ env.REGISTRY_LOWER }}/${{ env.REPOSITORY_LOWER }}
           tags: |
             type=raw,value=nightly
+            type=raw,value=custom
           labels: |
             org.opencontainers.image.authors="Open Home Foundation"
             org.opencontainers.image.base.name="docker.io/library/python:3.13-slim-trixie"
